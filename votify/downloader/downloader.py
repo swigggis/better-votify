@@ -93,10 +93,9 @@ class SpotifyDownloader:
         """
         Download media item with comprehensive error handling.
         ALWAYS registers track with playlist manager - INCLUDING file path for skipped files.
-        Writes M3U8 after EVERY track to ensure persistence on interruption.
+        M3U8 is written only at the end via finalize_playlists().
         """
         file_already_existed = False
-        track_registered = False
 
         try:
             # Check if file already exists BEFORE any processing
@@ -123,12 +122,11 @@ class SpotifyDownloader:
                     relative_path=relative_path,
                     total_tracks=total_tracks,
                 )
-                track_registered = True
 
-                track_status = "SKIPPED (exists)" if file_already_existed else "DOWNLOADING"
+                track_status = "EXISTS" if file_already_existed else "NEW"
                 logger.debug(
-                    f"Registered with playlist manager: "
-                    f"track {item.media.playlist_tags.track}/{total_tracks or '?'} - {track_status}"
+                    f"Registered: track {item.media.playlist_tags.track}/{total_tracks or '?'} "
+                    f"[{track_status}] → {Path(item.playlist_file_path).name}"
                 )
 
             # If file exists and we're not overwriting, raise exception AFTER registration
@@ -145,15 +143,6 @@ class SpotifyDownloader:
             await self._final_processing(item)
 
         finally:
-            # CRITICAL: Write M3U8 after EVERY track (downloaded or skipped)
-            # This ensures the playlist is updated incrementally, not just at the end
-            if track_registered and self.save_playlist_file and item.playlist_file_path:
-                try:
-                    self.playlist_manager.write_playlist(item.playlist_file_path)
-                    logger.debug(f"Updated M3U8: {Path(item.playlist_file_path).name}")
-                except Exception as e:
-                    logger.warning(f"Failed to update M3U8: {e}")
-
             if not self.skip_cleanup and not file_already_existed:
                 self._cleanup_temp(item.uuid_)
 
@@ -306,26 +295,25 @@ class SpotifyDownloader:
 
     def finalize_playlists(self) -> None:
         """
-        Write all collected playlists to disk (final pass).
-        This is called at the end of each URL to ensure everything is written.
-        Note: Individual tracks also trigger writes in download() method.
+        Write all collected playlists to disk.
+        This is called at the end of each URL to write the complete M3U8.
         """
         if self.save_playlist_file:
             if self.playlist_manager.playlists:
-                logger.info("Finalizing M3U8 playlist files...")
+                logger.info("Creating M3U8 playlist files...")
                 try:
                     self.playlist_manager.write_all_playlists()
                     stats = self.playlist_manager.get_stats()
                     if stats['total_playlists'] > 0:
                         logger.info(
-                            f"✓ Finalized {stats['total_playlists']} M3U8 file(s) "
-                            f"with {stats['total_tracks']} total track entries"
+                            f"✓ Created {stats['total_playlists']} M3U8 file(s) "
+                            f"with {stats['total_tracks']} track entries"
                         )
                 except Exception as e:
-                    logger.error(f"Error finalizing playlists: {e}")
+                    logger.error(f"Error creating playlists: {e}")
                     raise
                 finally:
                     # Clear for next URL
                     self.playlist_manager.clear()
             else:
-                logger.debug("No playlists registered for finalization")
+                logger.debug("No playlists to create")
