@@ -123,14 +123,21 @@ class PlaylistManager:
             return
 
         written_count = 0
+        failed_count = 0
+
         for playlist_file_path in self.playlists.keys():
             try:
                 self.write_playlist(playlist_file_path)
                 written_count += 1
             except Exception as e:
                 logger.error(f"Error writing playlist {playlist_file_path}: {e}")
+                failed_count += 1
 
-        logger.info(f"Finalized {written_count} M3U8 file(s)")
+        total = written_count + failed_count
+        logger.info(f"✓ Created/Updated {written_count}/{total} M3U8 file(s)")
+
+        if failed_count > 0:
+            logger.warning(f"⚠ Failed to write {failed_count} playlist(s)")
 
     def get_stats(self) -> Dict[str, int]:
         """Get statistics about managed playlists."""
