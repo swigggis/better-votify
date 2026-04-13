@@ -4,6 +4,7 @@ Database cleanup script - removes entries for files that no longer exist on disk
 """
 
 import logging
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -14,9 +15,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Common locations where votify stores its database
 DB_SEARCH_PATHS = [
     Path.home() / ".votify",
+    Path.home() / ".votify" / "database",
     Path.home() / ".config" / "votify",
     Path.home() / ".local" / "share" / "votify",
     Path("/root/votify-dev"),
@@ -45,44 +46,17 @@ def find_databases() -> list[Path]:
 
 
 def get_database_class():
-    """
-    Import the Database class regardless of where the script is executed from.
-    Tries multiple import strategies.
-    """
-    # Strategy 1: direct import (when inside the votify package)
-    try:
-        from votify.api.downloader import Database  # adjust if needed
-        return Database
-    except ImportError:
-        pass
+    """Import Database class from votify.cli.database"""
+    script_dir = Path(__file__).resolve().parent  # votify/
+    project_root = script_dir.parent              # votify-dev/
 
-    # Strategy 2: add parent dir to sys.path and import
-    script_dir = Path(__file__).resolve().parent
-    for candidate in [script_dir, script_dir.parent]:
-        if candidate not in sys.path:
-            sys.path.insert(0, str(candidate))
+    for path in [str(project_root), str(script_dir)]:
+        if path not in sys.path:
+            sys.path.insert(0, path)
 
-    # Strategy 3: import from local database.py if it exists next to this script
-    try:
-        from database import Database
-        return Database
-    except ImportError:
-        pass
-
-    # Strategy 4: load directly from file path
-    import importlib.util
-    for search_dir in [script_dir, script_dir.parent]:
-        db_module_path = search_dir / "database.py"
-        if db_module_path.exists():
-            spec = importlib.util.spec_from_file_location("database", db_module_path)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            return module.Database
-
-    raise ImportError(
-        "Could not find the Database class. "
-        "Make sure database.py is in the votify directory."
-    )
+    # Direct import now that we know the location
+    from votify.cli.database import Database
+    return Database
 
 
 def cleanup_database(db_path: Path, dry_run: bool = False) -> dict:
@@ -170,7 +144,7 @@ def main() -> None:
     parser.add_argument(
         "db_path",
         type=Path,
-        nargs="?",  # optional - if not given, we search automatically
+        nargs="?",
         help="Path to the SQLite database file. If omitted, common locations are scanned.",
     )
     parser.add_argument(
@@ -185,7 +159,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # --- Scan mode: just list found databases ---
+    # --- Scan mode ---
     if args.scan:
         logger.info("Scanning for databases...")
         dbs = find_databases()
@@ -209,18 +183,17 @@ def main() -> None:
         if not db_paths:
             logger.error(
                 "No databases found. Please provide the path manually:\n"
-                "  python db_update.py /path/to/media.db"
+                "  python db_update.py /path/to/votify.db"
             )
             sys.exit(1)
 
-        # If multiple found, ask user which one to use
         if len(db_paths) > 1:
             print("\nFound multiple databases:")
             for i, p in enumerate(db_paths):
                 print(f"  [{i}] {p.resolve()}")
             choice = input("Which one to clean? (number, or 'all'): ").strip()
             if choice == "all":
-                pass  # process all
+                pass
             elif choice.isdigit() and int(choice) < len(db_paths):
                 db_paths = [db_paths[int(choice)]]
             else:
@@ -231,13 +204,13 @@ def main() -> None:
     total_stats = {"total": 0, "found": 0, "missing": 0, "removed": 0}
 
     for db_path in db_paths:
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         result = cleanup_database(db_path=db_path, dry_run=args.dry_run)
         for key in total_stats:
             total_stats[key] += result[key]
 
     if len(db_paths) > 1:
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         logger.info("Overall summary:")
         logger.info(f"  Databases processed: {len(db_paths)}")
         logger.info(f"  Total entries:       {total_stats['total']}")
