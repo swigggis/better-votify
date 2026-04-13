@@ -92,7 +92,7 @@ class SpotifyDownloader:
     async def download(self, item: DownloadItem) -> None:
         """
         Download media item with comprehensive error handling.
-        ALWAYS registers track with playlist manager - even for skipped files.
+        ALWAYS registers track with playlist manager - INCLUDING file path for skipped files.
         Writes M3U8 after EVERY track to ensure persistence on interruption.
         """
         file_already_existed = False
@@ -105,6 +105,7 @@ class SpotifyDownloader:
                 logger.debug(f"File already exists: {item.final_path}")
 
             # CRITICAL: Register track with playlist manager FIRST
+            # For SKIPPED files, we still register the path since the file exists!
             if item.playlist_file_path and item.final_path and self.save_playlist_file:
                 relative_path = self.base.get_playlist_relative_path(
                     item.playlist_file_path,
@@ -115,6 +116,7 @@ class SpotifyDownloader:
                 if hasattr(item.media, 'playlist_tags') and item.media.playlist_tags:
                     total_tracks = getattr(item.media.playlist_tags, 'track_total', None)
 
+                # IMPORTANT: Register path for BOTH new downloads AND existing files
                 self.playlist_manager.add_track(
                     playlist_file_path=item.playlist_file_path,
                     track_number=item.media.playlist_tags.track,
@@ -123,10 +125,10 @@ class SpotifyDownloader:
                 )
                 track_registered = True
 
-                track_status = "SKIPPED" if file_already_existed else "downloading"
+                track_status = "SKIPPED (exists)" if file_already_existed else "DOWNLOADING"
                 logger.debug(
                     f"Registered with playlist manager: "
-                    f"track {item.media.playlist_tags.track}/{total_tracks or '?'} ({track_status})"
+                    f"track {item.media.playlist_tags.track}/{total_tracks or '?'} - {track_status}"
                 )
 
             # If file exists and we're not overwriting, raise exception AFTER registration
