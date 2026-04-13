@@ -1,3 +1,4 @@
+```python
 import asyncio
 import logging
 from typing import AsyncGenerator, Callable
@@ -178,7 +179,9 @@ class SpotifyInterface:
 
                 # Skip if track fetch failed
                 if media is None:
-                    logger.info(f"Skipping track {track_id} in album - failed to fetch metadata")
+                    logger.info(
+                        f"Skipping track {track_id} in album - failed to fetch metadata"
+                    )
                     continue
 
                 yield media
@@ -208,7 +211,9 @@ class SpotifyInterface:
 
                 # Skip if episode fetch failed
                 if media is None:
-                    logger.info(f"Skipping episode {episode_id} in show - failed to fetch metadata")
+                    logger.info(
+                        f"Skipping episode {episode_id} in show - failed to fetch metadata"
+                    )
                     continue
 
                 yield media
@@ -229,80 +234,102 @@ class SpotifyInterface:
 
         if playlist_data["__typename"] != "Playlist":
             yield VotifyMediaNotFoundException(media_id, playlist_data)
-        else:
-            playlist_items = playlist_data["content"]["items"]
-            
-            # Fetch all playlist items (pagination)
-            while len(playlist_items) < playlist_data["content"]["totalCount"]:
-                playlist_response = await self.base.api.get_playlist(
-                    media_id,
-                    len(playlist_items),
+            return
+
+        playlist_items = playlist_data["content"]["items"]
+
+        # Fetch all playlist items (pagination)
+        while len(playlist_items) < playlist_data["content"]["totalCount"]:
+            playlist_response = await self.base.api.get_playlist(
+                media_id,
+                len(playlist_items),
+            )
+
+            # Handle paginated playlist fetch failure
+            if playlist_response is None:
+                logger.warning(
+                    f"Pagination failed for playlist {media_id}, stopping at {len(playlist_items)} items"
                 )
+                break
 
-                # Handle paginated playlist fetch failure
-                if playlist_response is None:
-                    logger.warning(f"Pagination failed for playlist {media_id}, stopping at {len(playlist_items)} items")
-                    break
+            playlist_items.extend(
+                playlist_response["data"]["playlistV2"]["content"]["items"]
+            )
 
-                playlist_items.extend(
-                    playlist_response["data"]["playlistV2"]["content"]["items"]
-                )
-
-            # OPTIMIZATION: Batch database check for all tracks at once
-            existing_tracks = {}
-            if self.flat_filter and hasattr(self.flat_filter, '__self__'):
-                # Extract all track IDs
-                track_ids = []
-                track_data_map = {}
-                for item in playlist_items:
-                    track_data = item["itemV2"]["data"]
-                    track_id = track_data["uri"].split(":")[-1]
-                    track_ids.append(track_id)
-                    track_data_map[track_id] = track_data
-                
-                # Single batch query instead of one per track - MASSIVE SPEEDUP!
-                logger.info(f"Performing batch database check for {len(track_ids)} tracks...")
-                database = self.flat_filter.__self__
-                if hasattr(database, 'get_batch'):
-                    existing_tracks = database.get_batch(track_ids)
-                    logger.info(f"Found {len(existing_tracks)}/{len(track_ids)} tracks already downloaded")
-
-            # Process each track
-            for index, item in enumerate(playlist_items, start=1):
+        # OPTIMIZATION: Batch database check for all tracks at once
+        existing_tracks: dict[str, str] = {}
+        if self.flat_filter and hasattr(self.flat_filter, "__self__"):
+            track_ids: list[str] = []
+            for item in playlist_items:
                 track_data = item["itemV2"]["data"]
                 track_id = track_data["uri"].split(":")[-1]
+                track_ids.append(track_id)
 
-                # Skip if already in database (using batch check results)
-                if track_id in existing_tracks:
-                    logger.debug(f"[{index}/{len(playlist_items)}] Track already exists, skipping API call")
-                    yield VotifyMediaFlatFilterException(
-                        track_id,
-                        track_data,
-                        existing_tracks[track_id],
-                    )
-                    continue
+            logger.info(f"Performing batch database check for {len(track_ids)} tracks...")
+            database = self.flat_filter.__self__
+            if hasattr(database, "get_batch"):
+                existing_tracks = database.get_batch(track_ids)
+                logger.info(
+                    f"Found {len(existing_tracks)}/{len(track_ids)} tracks already downloaded"
+                )
 
-                if track_data["__typename"] == "Track":
-                    media = await self._get_track_media(
-                        track_id=track_id,
-                    )
-                elif track_data["__typename"] == "Episode":
-                    media = await self._get_episode_media(
-                        episode_id=track_id,
-                    )
-                else:
-                    yield VotifyMediaNotFoundException(track_id, track_data)
-                    continue
+        # Process each track
+        for index, item in enumerate(playlist_items, start=1):
+            track_data = item["itemV2"]["data"]
+            track_id = track_data["uri"].split(":")[-1]
 
-                # Skip if track/episode fetch failed
-                if media is None:
-                    logger.info(f"Skipping item {index} in playlist - failed to fetch metadata")
-                    continue
+            # Skip if already in database (using batch check results)
+            if track_id in existing_tracks:
+                logger.debug(
+                    f"[{index}/{len(playlist_items)}] Track already exists, skipping API call"
+                )
 
-                media.playlist_metadata = playlist_data
-                media.playlist_tags = self.base.get_playlist_tags(playlist_data, index)
+                # FIX: still create minimal SpotifyMedia so playlist_tags exist.
+                minimal_media = SpotifyMedia(
+                    media_id=track_id,
+                    media_metadata=track_data,
+                )
+                minimal_media.playlist_metadata = playlist_data
+                minimal_media.playlist_tags = self.base.get_playlist_tags(
+                    playlist_data, index
+                )
 
-                yield media
+                exc = VotifyMediaFlatFilterException(
+                    track_id,
+                    track_data,
+                    existing_tracks[track_id],
+                )
+
+                # Attach the minimal media and known file path (from DB)
+                exc.media = minimal_media
+                exc.file_path = existing_tracks[track_id]
+
+                yield exc
+                continue
+
+            if track_data["__typename"] == "Track":
+                media = await self._get_track_media(
+                    track_id=track_id,
+                )
+            elif track_data["__typename"] == "Episode":
+                media = await self._get_episode_media(
+                    episode_id=track_id,
+                )
+            else:
+                yield VotifyMediaNotFoundException(track_id, track_data)
+                continue
+
+            # Skip if track/episode fetch failed
+            if media is None:
+                logger.info(
+                    f"Skipping item {index} in playlist - failed to fetch metadata"
+                )
+                continue
+
+            media.playlist_metadata = playlist_data
+            media.playlist_tags = self.base.get_playlist_tags(playlist_data, index)
+
+            yield media
 
     async def _get_artist_media(
         self,
@@ -409,7 +436,9 @@ class SpotifyInterface:
 
             # Skip if track fetch failed
             if media is None:
-                logger.info(f"Skipping top track {track_id} - failed to fetch metadata")
+                logger.info(
+                    f"Skipping top track {track_id} - failed to fetch metadata"
+                )
                 continue
 
             yield media
@@ -438,15 +467,15 @@ class SpotifyInterface:
         related_total = videos_data["relatedMusicVideos"]["totalCount"]
         unmapped_total = videos_data["unmappedMusicVideos"]["totalCount"]
 
-        while (
-            len(related_items) < related_total or len(unmapped_items) < unmapped_total
-        ):
+        while len(related_items) < related_total or len(unmapped_items) < unmapped_total:
             offset = max(len(related_items), len(unmapped_items))
             videos_response = await self.base.api.get_artist_videos(media_id, offset)
 
             # Handle paginated videos fetch failure
             if videos_response is None:
-                logger.warning(f"Pagination failed for artist videos {media_id}, stopping early")
+                logger.warning(
+                    f"Pagination failed for artist videos {media_id}, stopping early"
+                )
                 break
 
             videos_data = videos_response["data"]["artistUnion"]
@@ -539,7 +568,9 @@ class SpotifyInterface:
 
             # Handle paginated albums fetch failure
             if albums_response is None:
-                logger.warning(f"Pagination failed for artist {key} {media_id}, stopping early")
+                logger.warning(
+                    f"Pagination failed for artist {key} {media_id}, stopping early"
+                )
                 break
 
             album_items.extend(
@@ -623,7 +654,9 @@ class SpotifyInterface:
 
                 # Skip if track/episode fetch failed
                 if media is None:
-                    logger.info(f"Skipping liked track {track_id} - failed to fetch metadata")
+                    logger.info(
+                        f"Skipping liked track {track_id} - failed to fetch metadata"
+                    )
                     continue
 
                 yield media
@@ -638,43 +671,47 @@ class SpotifyInterface:
         if auto_media_option == AutoMediaOption.LIKED_TRACKS:
             async for media in self._get_liked_tracks_media():
                 yield media
-        else:
-            url_info = self.base.parse_url_info(url)
+            return
 
-            if not url_info or url_info.media_type in self.base.disallowed_media_types:
-                yield VotifyUnsupportedMediaTypeException(
-                    getattr(
-                        url_info,
-                        "media_type",
-                        "Null URL",
-                    ),
+        url_info = self.base.parse_url_info(url)
+
+        if not url_info or url_info.media_type in self.base.disallowed_media_types:
+            yield VotifyUnsupportedMediaTypeException(
+                getattr(
+                    url_info,
+                    "media_type",
+                    "Null URL",
+                ),
+            )
+        elif url_info.media_type == "track":
+            media = await self._get_track_media(url_info.media_id)
+            if media is not None:
+                yield media
+            else:
+                logger.info(
+                    f"Track {url_info.media_id} was skipped - failed to fetch metadata"
                 )
-            elif url_info.media_type == "track":
-                media = await self._get_track_media(url_info.media_id)
-                # Skip if track fetch failed
-                if media is not None:
-                    yield media
-                else:
-                    logger.info(f"Track {url_info.media_id} was skipped - failed to fetch metadata")
-            elif url_info.media_type == "episode":
-                media = await self._get_episode_media(url_info.media_id)
-                # Skip if episode fetch failed
-                if media is not None:
-                    yield media
-                else:
-                    logger.info(f"Episode {url_info.media_id} was skipped - failed to fetch metadata")
-            elif url_info.media_type == "album":
-                async for media in self._get_album_media(url_info.media_id):
-                    yield media
-            elif url_info.media_type == "show":
-                async for media in self._get_show_media(url_info.media_id):
-                    yield media
-            elif url_info.media_type == "playlist":
-                async for media in self._get_playlist_media(url_info.media_id):
-                    yield media
-            elif url_info.media_type == "artist":
-                async for media in self._get_artist_media(
-                    url_info.media_id,
-                    auto_media_option,
-                ):
-                    yield media
+        elif url_info.media_type == "episode":
+            media = await self._get_episode_media(url_info.media_id)
+            if media is not None:
+                yield media
+            else:
+                logger.info(
+                    f"Episode {url_info.media_id} was skipped - failed to fetch metadata"
+                )
+        elif url_info.media_type == "album":
+            async for media in self._get_album_media(url_info.media_id):
+                yield media
+        elif url_info.media_type == "show":
+            async for media in self._get_show_media(url_info.media_id):
+                yield media
+        elif url_info.media_type == "playlist":
+            async for media in self._get_playlist_media(url_info.media_id):
+                yield media
+        elif url_info.media_type == "artist":
+            async for media in self._get_artist_media(
+                url_info.media_id,
+                auto_media_option,
+            ):
+                yield media
+```
