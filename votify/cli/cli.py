@@ -32,6 +32,7 @@ from ..interface.video import SpotifyVideoInterface
 from .cli_config import CliConfig
 from .config_file import ConfigFile
 from .database import Database
+from .download_tracker import DownloadTracker
 from .utils import CustomLoggerFormatter, prompt_path
 
 logger = logging.getLogger(__name__)
@@ -202,12 +203,16 @@ async def main(config: CliConfig):
     else:
         urls = config.urls
 
+    # Initialize download tracker
+    tracker = DownloadTracker(log_path="votify_downloads.json")
+
     error_count = 0
     for url_index, url in enumerate(urls, 1):
         url_progress = click.style(f"[URL {url_index}/{len(urls)}]", dim=True)
         logger.info(url_progress + f' Processing "{url}"')
         download_queue = downloader.get_download_item(url, config.auto_media_option)
         download_index = 1
+
         while True:
             item = None
             download_queue_progress = click.style(
@@ -222,14 +227,22 @@ async def main(config: CliConfig):
                 break
             except VotifyUrlParseException as e:
                 logger.error(url_progress + f" {str(e)}")
+                tracker.add_failed("unknown", url, str(e), download_index)
                 break
             except VotifyMediaException as e:
                 media_title = "Unknown Title"
+                media_id = "unknown"
+
                 if e.media_metadata and e.media_metadata.get("name"):
                     media_title = e.media_metadata["name"]
+                if e.media_metadata and e.media_metadata.get("uri"):
+                    media_id = e.media_metadata["uri"].split(":")[-1]
 
                 if isinstance(e, VotifyMediaFlatFilterException):
                     e = VotifyMediaFileExists(media_path=e.result)
+                    tracker.add_skipped(media_id, media_title, "File already exists", download_index)
+                else:
+                    tracker.add_skipped(media_id, media_title, str(e), download_index)
 
                 logger.warning(
                     download_queue_progress + f' Skipping "{media_title}": {str(e)}'
@@ -242,26 +255,35 @@ async def main(config: CliConfig):
                     download_queue_progress + f" Error fetching media: {str(e)}",
                     exc_info=not config.no_exceptions,
                 )
+                tracker.add_failed("unknown", "Unknown", str(e), download_index)
                 download_index += 1
                 continue
 
             media_title = item.media.media_metadata["name"] if item else "Unknown Title"
+            media_id = item.media.media_id if item else "unknown"
 
             try:
                 logger.info(download_queue_progress + f' Downloading "{media_title}"')
 
                 await downloader.download(item)
+
+                # Track successful download
+                final_path = str(item.final_path) if item.final_path else "unknown"
+                tracker.add_successful(media_id, media_title, final_path, download_index)
+
             except Exception as e:
                 if isinstance(e, VotifyDownloaderException):
                     logger.warning(
                         download_queue_progress + f' Skipping "{media_title}": {str(e)}'
                     )
+                    tracker.add_skipped(media_id, media_title, str(e), download_index)
                 else:
                     error_count += 1
                     logger.error(
                         download_queue_progress + f' Error downloading "{media_title}"',
                         exc_info=not config.no_exceptions,
                     )
+                    tracker.add_failed(media_id, media_title, str(e), download_index)
             finally:
                 download_index += 1
                 if (
@@ -274,5 +296,17 @@ async def main(config: CliConfig):
                     media_id = item.media.media_metadata["uri"].split(":")[-1]
                     database.add(media_id, item.final_path)
                 await asyncio.sleep(config.wait_interval)
+        
+        # Finalize playlists for this URL after all tracks are processed
+        logger.debug(f"Finalizing playlists for URL {url_index}/{len(urls)}")
+        downloader.finalize_playlists()
 
+    # Print final summary
+    tracker.print_summary()
     logger.info(f"Finished with {error_count} error(s)")
+
+    # Show API skip summary if available
+    if hasattr(api, 'get_skipped_summary'):
+        skip_summary = api.get_skipped_summary()
+        if skip_summary['total_skipped'] > 0:
+            logger.info(f"\nAPI Skipped {skip_summary['total_skipped']} operations due to errors")
