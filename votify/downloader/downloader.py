@@ -16,6 +16,7 @@ from .exceptions import (
 from .playlist_manager import PlaylistManager
 from .types import DownloadItem
 from .video import SpotifyVideoDownloader
+from ..interface.exceptions import VotifyMediaFlatFilterException
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,33 @@ class SpotifyDownloader:
     ) -> AsyncGenerator[DownloadItem | BaseException, None]:
         async for media in self.base.interface.get_media(url, auto_media_option):
             if isinstance(media, BaseException):
+                if isinstance(media, VotifyMediaFlatFilterException):
+                    # The flat-filter skipped this track (already in DB).
+                    # If the exception carries the media object, parse it into a
+                    # DownloadItem and yield it normally — download() will detect
+                    # the file already exists and skip the download while still
+                    # registering the track with the playlist manager.
+                    flat_media = getattr(media, "media", None)
+                    if flat_media is not None:
+                        try:
+                            if flat_media.tags.media_type in {
+                                MediaType.SONG,
+                                MediaType.PODCAST,
+                            }:
+                                yield self.audio.parse_item(flat_media)
+                            elif flat_media.tags.media_type in {
+                                MediaType.MUSIC_VIDEO,
+                                MediaType.PODCAST_VIDEO,
+                            }:
+                                yield self.video.parse_item(flat_media)
+                            else:
+                                yield media
+                        except Exception:
+                            # If parsing fails for any reason, fall back to
+                            # yielding the exception so the caller can log it.
+                            yield media
+                        continue
+                # Re-yield all other exceptions as-is for the caller to handle.
                 yield media
                 continue
 
@@ -68,6 +96,36 @@ class SpotifyDownloader:
                 MediaType.PODCAST_VIDEO,
             }:
                 yield self.video.parse_item(media)
+
+    def register_skipped_playlist_track(self, item: DownloadItem) -> None:
+        """
+        Register a track with the playlist manager without downloading.
+        Used for tracks skipped by the flat-filter (already in DB) so their
+        paths still appear in the m3u8 even when no new download happens.
+        """
+        if not (item.playlist_file_path and item.final_path and self.save_playlist_file):
+            return
+
+        relative_path = self.base.get_playlist_relative_path(
+            item.playlist_file_path,
+            item.final_path,
+        )
+
+        total_tracks = None
+        if hasattr(item.media, 'playlist_tags') and item.media.playlist_tags:
+            total_tracks = getattr(item.media.playlist_tags, 'track_total', None)
+
+        self.playlist_manager.add_track(
+            playlist_file_path=item.playlist_file_path,
+            track_number=item.media.playlist_tags.track,
+            relative_path=relative_path,
+            total_tracks=total_tracks,
+        )
+
+        logger.debug(
+            f"Registered skipped track with playlist manager: "
+            f"track {item.media.playlist_tags.track}/{total_tracks or '?'}"
+        )
 
     async def download(self, item: DownloadItem) -> None:
         """
@@ -86,7 +144,7 @@ class SpotifyDownloader:
                 file_already_existed = True
                 logger.debug(f"File already exists: {item.final_path}")
 
-            # ✨ CRITICAL: Register track with playlist manager FIRST
+            # CRITICAL: Register track with playlist manager FIRST
             # This ensures M3U8 is created even if ALL tracks are skipped
             if item.playlist_file_path and item.final_path and self.save_playlist_file:
                 relative_path = self.base.get_playlist_relative_path(
@@ -284,7 +342,7 @@ class SpotifyDownloader:
     def finalize_playlists(self) -> None:
         """
         Write all collected playlists to disk.
-        ✨ ALWAYS creates M3U8 files, even if:
+        ALWAYS creates M3U8 files, even if:
         - Only skipped tracks (all files already exist)
         - Mix of downloaded and skipped tracks
         - Only newly downloaded tracks
@@ -298,7 +356,7 @@ class SpotifyDownloader:
                     stats = self.playlist_manager.get_stats()
                     if stats['total_playlists'] > 0:
                         logger.info(
-                            f"✓ Finalized {stats['total_playlists']} M3U8 file(s) "
+                            f"Finalized {stats['total_playlists']} M3U8 file(s) "
                             f"with {stats['total_tracks']} total track entries"
                         )
                 except Exception as e:
