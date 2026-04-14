@@ -9,7 +9,7 @@ A command-line app for downloading songs, podcasts and videos from Spotify.
 
 This repository is a **fork** of the original Votify by @glomatico:
 - Upstream: https://github.com/glomatico/votify
-- Fork: https://github.com/YOUR_GITHUB_USER/votify
+- Fork: https://github.com/swigggis/better-votify/
 
 ## Fork goals / changes
 
